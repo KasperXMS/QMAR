@@ -187,8 +187,18 @@ def extract_image(
         # Extract from TSV
         # The request_id format is typically {dataset}_{index}
         # or stored in rec.image_id / extra
-        img_index = rec.extra.get("index", None) or rec.image_id
+        # Extract from TSV using the stored tsv_index
+        img_index = rec.extra.get("tsv_index", None)
         if img_index is None:
+            # Fallback: try image_id, stripping dataset prefix if present
+            # image_id format: "{dataset}_{idx}" — extract just the idx
+            raw = rec.image_id or ""
+            if raw.startswith(rec.dataset_name + "_"):
+                img_index = raw[len(rec.dataset_name) + 1:]
+            else:
+                img_index = raw
+
+        if not img_index:
             # Try parsing from request_id
             parts = rec.request_id.rsplit("_", 1)
             if len(parts) == 2 and parts[1].isdigit():
