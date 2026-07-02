@@ -1,0 +1,49 @@
+# QMAR Pipeline Configuration
+
+# Data paths
+data:
+  vl_routerbench_root: "../VL-RouterBench/vlm_router_data"
+  mmr_bench_csv: "../MMR-Bench/data/MMR_Bench.csv"
+  mmr_bench_image_root: "../MMR-Bench/data"
+
+# Predictor configuration
+predictor:
+  vision_encoder: "openai/clip-vit-base-patch32"
+  text_encoder: "sentence-transformers/all-MiniLM-L6-v2"
+  vision_dim: 512
+  text_dim: 384
+  fusion_hidden_dims: [1024, 512]
+  fusion_output_dim: 512
+  suit_hidden_dim: 256
+  type_hidden_dim: 128
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 32
+  num_epochs: 50
+  lr: 0.001
+  weight_decay: 0.0001
+  alpha: 1.0  # weight for answer-type loss
+  use_focal: true
+  focal_gamma: 2.0
+  patience: 10
+  num_workers: 4
+
+# QMAR scheduler
+scheduler:
+  quality_threshold: 0.5
+  use_comm_cost: true
+
+# Experiment
+experiment:
+  random_seed: 42
+  test_split_ratio: 0.2
+  threshold_sweep: [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  datasets:
+    - "MMBench_DEV_EN_V11"
+    - "MMStar"
+    - "MathVista_MINI"
+    - "TextVQA_VAL"
+    - "OCRBench"
+    - "RealWorldQA"

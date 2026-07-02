@@ -1,0 +1,51 @@
+# Instance Pool Configuration
+# Edge-only deployment: Orin NX 16GB + AGX Orin 32GB + RTX 4090 24GB
+#
+# Each instance = (model, device_class).
+# Cross-device model overlap creates non-trivial suitability-vs-latency trade-offs:
+#   - SmolVLM2, Phi-3.5-Vision on both NX and AGX
+#   - Qwen2.5-VL-7B on both AGX and 4090
+
+instances:
+  # ── Orin NX 16GB — tiny/small edge models ──
+  - instance_id: "SmolVLM2@NX"
+    model_name: "SmolVLM2"
+    device_class: "Orin_NX"
+
+  - instance_id: "Janus-1B@NX"
+    model_name: "Janus-Pro-1B"
+    device_class: "Orin_NX"
+
+  - instance_id: "Phi-3.5@NX"
+    model_name: "Phi-3.5-Vision"
+    device_class: "Orin_NX"
+
+  # ── AGX Orin 32GB — small/medium edge models ──
+  - instance_id: "SmolVLM2@AGX"
+    model_name: "SmolVLM2"
+    device_class: "AGX_Orin"
+
+  - instance_id: "Phi-3.5@AGX"
+    model_name: "Phi-3.5-Vision"
+    device_class: "AGX_Orin"
+
+  - instance_id: "Qwen-7B@AGX"
+    model_name: "Qwen2.5-VL-7B"
+    device_class: "AGX_Orin"
+
+  - instance_id: "LLaVA-7B@AGX"
+    model_name: "LLaVA-Next-Vicuna-7B"
+    device_class: "AGX_Orin"
+
+  # ── RTX 4090 24GB — medium/large edge models ──
+  - instance_id: "Qwen-7B@4090"
+    model_name: "Qwen2.5-VL-7B"
+    device_class: "RTX_4090"
+
+  - instance_id: "Pixtral-12B@4090"
+    model_name: "Pixtral-12B"
+    device_class: "RTX_4090"
+
+  - instance_id: "Qwen-32B@4090"
+    model_name: "Qwen2.5-VL-32B"
+    device_class: "RTX_4090"
