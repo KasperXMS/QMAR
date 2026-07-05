@@ -146,7 +146,7 @@ class QwenVLAdapter(ModelAdapter):
 
     def load(self, device: str, model_id: Optional[str] = None) -> None:
         import torch
-        from transformers import Qwen2_5VLForConditionalGeneration, AutoProcessor
+        from transformers import AutoProcessor
 
         mid = model_id or self.DEFAULT_MODEL_ID
         logger.info(f"Loading Qwen2.5-VL: {mid}")
@@ -154,7 +154,20 @@ class QwenVLAdapter(ModelAdapter):
         self._device = device
         self.processor = AutoProcessor.from_pretrained(mid, trust_remote_code=True)
 
-        self.model = Qwen2_5VLForConditionalGeneration.from_pretrained(
+        # Try Qwen2_5VLForConditionalGeneration first (transformers ≥ 4.45),
+        # fall back to AutoModelForVision2Seq for older versions
+        try:
+            from transformers import Qwen2_5VLForConditionalGeneration
+            model_cls = Qwen2_5VLForConditionalGeneration
+        except ImportError:
+            from transformers import AutoModelForVision2Seq
+            model_cls = AutoModelForVision2Seq
+            logger.warning(
+                "Qwen2_5VLForConditionalGeneration not available — "
+                "using AutoModelForVision2Seq. Upgrade to transformers>=4.45 for full support."
+            )
+
+        self.model = model_cls.from_pretrained(
             mid,
             torch_dtype=torch.float16 if device != "cpu" else torch.float32,
             device_map=device if device != "cpu" else None,
@@ -461,13 +474,14 @@ class PhiVisionAdapter(ModelAdapter):
             mid, trust_remote_code=True
         )
 
+        # Use SDPA (PyTorch native) — works everywhere without flash_attn
+        attn = "sdpa" if device != "cpu" else "eager"
         self.model = AutoModelForCausalLM.from_pretrained(
             mid,
             torch_dtype=torch.float16 if device != "cpu" else torch.float32,
             device_map=device if device != "cpu" else None,
             trust_remote_code=True,
-            # Phi-3.5 uses flash attention by default; disable if not available
-            _attn_implementation="eager" if device == "cpu" else "flash_attention_2",
+            _attn_implementation=attn,
         )
         if device == "cpu":
             self.model = self.model.to(device)
