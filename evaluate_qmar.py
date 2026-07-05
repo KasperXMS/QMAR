@@ -113,11 +113,13 @@ def main():
     instance_config = inst_cfg["instances"]
     instance_ids = [c["instance_id"] for c in instance_config]
 
-    # ---- Build latency table ----
-    builder = LatencyTableBuilder()
-    for cfg in instance_config:
-        builder.add_instance(**cfg)
-    latency_table = builder.build()
+    # ---- Build latency table (TOPS-calibrated physical model) ----
+    from profiling.latency_table import build_theoretical_table
+
+    latency_table = build_theoretical_table(instance_config)
+    # To calibrate with real profiling, replace the line above with:
+    #   alpha = calibrate_alpha("Phi-3.5-Vision", "AGX_Orin", "simple", measured=195)
+    #   latency_table = build_theoretical_table(instance_config, alpha=alpha)
 
     comm_profile = build_comm_profile(instance_config)
 

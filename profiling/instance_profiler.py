@@ -129,36 +129,25 @@ class ModelAdapter(ABC):
         """Free GPU memory."""
         ...
 
-    def _fallback_load(self, device: str, mid: str) -> bool:
-        """Fallback: load config with trust_remote_code, then model.
+    def _load_model(self, device: str, mid: str) -> None:
+        """Load a VLM via AutoModel — works across transformers 4.x and 5.x.
 
-        Some transformers versions (notably 4.46.x) reject unknown model_types
-        in AutoConfig even with trust_remote_code=True. This bypasses that by
-        loading the config object first.
-
-        Returns True on success.
+        AutoModelForVision2Seq was removed in transformers 5.x; AutoModel is
+        the stable API that resolves to the correct architecture in all versions.
         """
         import torch
-        from transformers import AutoConfig, AutoModel, AutoModelForVision2Seq
+        from transformers import AutoModel
 
         self._device = device
-        for model_cls in [AutoModelForVision2Seq, AutoModel]:
-            try:
-                config = AutoConfig.from_pretrained(mid, trust_remote_code=True)
-                self.model = model_cls.from_pretrained(
-                    mid,
-                    config=config,
-                    torch_dtype=torch.float16 if device != "cpu" else torch.float32,
-                    device_map=device if device != "cpu" else None,
-                    trust_remote_code=True,
-                )
-                if device == "cpu":
-                    self.model = self.model.to(device)
-                self.model.eval()
-                return True
-            except Exception:
-                continue
-        return False
+        self.model = AutoModel.from_pretrained(
+            mid,
+            torch_dtype=torch.float16 if device != "cpu" else torch.float32,
+            device_map=device if device != "cpu" else None,
+            trust_remote_code=True,
+        )
+        if device == "cpu":
+            self.model = self.model.to(device)
+        self.model.eval()
 
 
 class QwenVLAdapter(ModelAdapter):
@@ -184,40 +173,7 @@ class QwenVLAdapter(ModelAdapter):
 
         self._device = device
         self.processor = AutoProcessor.from_pretrained(mid, trust_remote_code=True)
-
-        # Try Qwen2_5VLForConditionalGeneration first (transformers ≥ 4.45),
-        # fall back to AutoModelForVision2Seq for older versions
-        try:
-            from transformers import Qwen2_5VLForConditionalGeneration
-            model_cls = Qwen2_5VLForConditionalGeneration
-        except ImportError:
-            from transformers import AutoModelForVision2Seq
-            model_cls = AutoModelForVision2Seq
-            logger.warning(
-                "Qwen2_5VLForConditionalGeneration not available — "
-                "using AutoModelForVision2Seq. Upgrade to transformers>=4.45 for full support."
-            )
-
-        try:
-            self.model = model_cls.from_pretrained(
-                mid,
-                torch_dtype=torch.float16 if device != "cpu" else torch.float32,
-                device_map=device if device != "cpu" else None,
-                trust_remote_code=True,
-            )
-        except ValueError:
-            logger.warning(
-                "Direct loading failed — trying fallback via AutoConfig..."
-            )
-            if not self._fallback_load(device, mid):
-                raise RuntimeError(
-                    f"Cannot load {mid}: model type not recognized by "
-                    f"this transformers version. Try: pip install --upgrade transformers"
-                )
-
-        if device == "cpu":
-            self.model = self.model.to(device)
-        self.model.eval()
+        self._load_model(device, mid)
         logger.info(f"  Loaded. Device: {next(self.model.parameters()).device}")
 
     def generate(
@@ -319,15 +275,7 @@ class LlavaAdapter(ModelAdapter):
 
         self._device = device
         self.processor = AutoProcessor.from_pretrained(mid)
-
-        self.model = LlavaForConditionalGeneration.from_pretrained(
-            mid,
-            torch_dtype=torch.float16 if device != "cpu" else torch.float32,
-            device_map=device if device != "cpu" else None,
-        )
-        if device == "cpu":
-            self.model = self.model.to(device)
-        self.model.eval()
+        self._load_model(device, mid)
         logger.info(f"  Loaded. Device: {next(self.model.parameters()).device}")
 
     def generate(
@@ -410,55 +358,16 @@ class SmolVLMAdapter(ModelAdapter):
         self._device = None
 
     def load(self, device: str, model_id: Optional[str] = None) -> None:
-        import torch
-
         mid = model_id or self.DEFAULT_MODEL_ID
         logger.info(f"Loading SmolVLM2: {mid}")
 
         self._device = device
-
-        # Try to get processor — SmolVLM2 needs trust_remote_code
         try:
             from transformers import AutoProcessor
-            self.processor = AutoProcessor.from_pretrained(
-                mid, trust_remote_code=True
-            )
-        except Exception as e:
-            logger.warning(f"AutoProcessor failed: {e}. Trying without processor...")
+            self.processor = AutoProcessor.from_pretrained(mid, trust_remote_code=True)
+        except Exception:
             self.processor = None
-
-        # Try model-specific class first, fall back to AutoModel
-        try:
-            from transformers import AutoModelForVision2Seq
-            model_cls = AutoModelForVision2Seq
-        except ImportError:
-            from transformers import AutoModel
-            model_cls = AutoModel
-            logger.warning(
-                "AutoModelForVision2Seq not available — "
-                "using AutoModel. Upgrade to transformers>=4.40 for full support."
-            )
-
-        try:
-            self.model = model_cls.from_pretrained(
-                mid,
-                torch_dtype=torch.float16 if device != "cpu" else torch.float32,
-                device_map=device if device != "cpu" else None,
-                trust_remote_code=True,
-            )
-        except ValueError:
-            logger.warning(
-                "Direct loading failed — trying fallback via AutoConfig..."
-            )
-            if not self._fallback_load(device, mid):
-                raise RuntimeError(
-                    f"Cannot load {mid}: model type not recognized by "
-                    f"this transformers version. Try: pip install --upgrade transformers"
-                )
-
-        if device == "cpu":
-            self.model = self.model.to(device)
-        self.model.eval()
+        self._load_model(device, mid)
         logger.info(f"  Loaded. Device: {next(self.model.parameters()).device}")
 
     def generate(
@@ -547,22 +456,8 @@ class PhiVisionAdapter(ModelAdapter):
         logger.info(f"Loading Phi-3.5-Vision: {mid}")
 
         self._device = device
-        self.processor = AutoProcessor.from_pretrained(
-            mid, trust_remote_code=True
-        )
-
-        # Phi3V only supports eager attention
-        attn = "eager"
-        self.model = AutoModelForCausalLM.from_pretrained(
-            mid,
-            torch_dtype=torch.float16 if device != "cpu" else torch.float32,
-            device_map=device if device != "cpu" else None,
-            trust_remote_code=True,
-            _attn_implementation=attn,
-        )
-        if device == "cpu":
-            self.model = self.model.to(device)
-        self.model.eval()
+        self.processor = AutoProcessor.from_pretrained(mid, trust_remote_code=True)
+        self._load_model(device, mid)
         logger.info(f"  Loaded. Device: {next(self.model.parameters()).device}")
 
     def generate(
@@ -638,24 +533,23 @@ class PixtralAdapter(ModelAdapter):
         self._device = None
 
     def load(self, device: str, model_id: Optional[str] = None) -> None:
-        import torch
-        from transformers import AutoProcessor, AutoModelForVision2Seq
-
         mid = model_id or self.DEFAULT_MODEL_ID
         logger.info(f"Loading Pixtral: {mid}")
 
         self._device = device
-        self.processor = AutoProcessor.from_pretrained(mid, trust_remote_code=True)
 
-        self.model = AutoModelForVision2Seq.from_pretrained(
-            mid,
-            torch_dtype=torch.float16 if device != "cpu" else torch.float32,
-            device_map=device if device != "cpu" else None,
-            trust_remote_code=True,
-        )
-        if device == "cpu":
-            self.model = self.model.to(device)
-        self.model.eval()
+        # Pixtral may not have a unified AutoProcessor
+        try:
+            from transformers import AutoProcessor
+            self.processor = AutoProcessor.from_pretrained(mid, trust_remote_code=True)
+        except (ValueError, ImportError):
+            logger.info("  No unified processor — loading tokenizer + image processor separately")
+            self.processor = None
+            from transformers import AutoTokenizer, AutoImageProcessor
+            self._tokenizer = AutoTokenizer.from_pretrained(mid, trust_remote_code=True)
+            self._image_processor = AutoImageProcessor.from_pretrained(mid, trust_remote_code=True)
+
+        self._load_model(device, mid)
         logger.info(f"  Loaded. Device: {next(self.model.parameters()).device}")
 
     def generate(
@@ -669,23 +563,29 @@ class PixtralAdapter(ModelAdapter):
 
         image = Image.open(image_path).convert("RGB")
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
+        if self.processor is not None:
+            # Unified processor path
+            messages = [
+                {"role": "user", "content": [
                     {"type": "image", "image": image},
                     {"type": "text", "text": question},
-                ],
-            }
-        ]
-        prompt = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-
-        # Pixtral expects a list of images
-        inputs = self.processor(
-            text=prompt, images=[image], return_tensors="pt"
-        ).to(self._device)
+                ]}
+            ]
+            prompt = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = self.processor(
+                text=prompt, images=[image], return_tensors="pt"
+            ).to(self._device)
+        else:
+            # Separate tokenizer + image processor path
+            img_inputs = self._image_processor(images=[image], return_tensors="pt")
+            img_inputs = {k: v.to(self._device) for k, v in img_inputs.items()}
+            text_inputs = self._tokenizer(
+                question, return_tensors="pt", padding=True
+            )
+            text_inputs = {k: v.to(self._device) for k, v in text_inputs.items()}
+            inputs = {**img_inputs, **text_inputs}
 
         if self._device != "cpu":
             torch.cuda.synchronize()
@@ -704,11 +604,16 @@ class PixtralAdapter(ModelAdapter):
 
         generated_ids = [
             out_ids[len(in_ids):]
-            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            for in_ids, out_ids in zip(inputs.get("input_ids", inputs.get("pixel_values")), generated_ids)
         ]
-        output_text = self.processor.batch_decode(
-            generated_ids, skip_special_tokens=True
-        )[0]
+        if self.processor is not None:
+            output_text = self.processor.batch_decode(
+                generated_ids, skip_special_tokens=True
+            )[0]
+        else:
+            output_text = self._tokenizer.batch_decode(
+                generated_ids, skip_special_tokens=True
+            )[0]
         num_tokens = len(generated_ids[0])
 
         return output_text, elapsed_ms, num_tokens
@@ -746,17 +651,8 @@ class JanusAdapter(ModelAdapter):
         logger.info(f"Loading Janus: {mid}")
 
         self._device = device
-        # Janus uses a custom processor; load via AutoModel
-        self.processor = None  # Janus may not have a standard HF processor
-        self.model = AutoModelForCausalLM.from_pretrained(
-            mid,
-            torch_dtype=torch.float16 if device != "cpu" else torch.float32,
-            device_map=device if device != "cpu" else None,
-            trust_remote_code=True,
-        )
-        if device == "cpu":
-            self.model = self.model.to(device)
-        self.model.eval()
+        self.processor = None  # Janus uses custom generate(), no HF processor needed
+        self._load_model(device, mid)
         logger.info(f"  Loaded. Device: {next(self.model.parameters()).device}")
 
     def generate(
@@ -817,17 +713,16 @@ MODEL_REGISTRY: Dict[str, Tuple[type, str]] = {
 def get_adapter(model_name: str, custom_model_id: Optional[str] = None) -> ModelAdapter:
     """Factory: return a ModelAdapter for the given model_name."""
     if model_name in MODEL_REGISTRY:
-        adapter_cls, _ = MODEL_REGISTRY[model_name]
+        adapter_cls, default_hf_id = MODEL_REGISTRY[model_name]
         adapter = adapter_cls()
-        # Override default HF ID if custom provided
-        if custom_model_id:
-            setattr(adapter, 'DEFAULT_MODEL_ID', custom_model_id)
+        # Use registry's HF ID unless overridden
+        adapter.DEFAULT_MODEL_ID = custom_model_id or default_hf_id
         return adapter
 
     # Fallback: try as a generic transformers VLM
     logger.warning(
         f"Model '{model_name}' not in registry. "
-        f"Trying generic AutoModelForVision2Seq. Results may vary."
+        f"Trying generic AutoModel. Results may vary."
     )
     return _GenericVLAdapter(model_name)
 
@@ -843,21 +738,12 @@ class _GenericVLAdapter(ModelAdapter):
         self.DEFAULT_MODEL_ID = model_name
 
     def load(self, device: str, model_id: Optional[str] = None) -> None:
-        import torch
-        from transformers import AutoProcessor, AutoModelForVision2Seq
+        from transformers import AutoProcessor
 
         mid = model_id or self._model_name
         self._device = device
         self.processor = AutoProcessor.from_pretrained(mid, trust_remote_code=True)
-        self.model = AutoModelForVision2Seq.from_pretrained(
-            mid,
-            torch_dtype=torch.float16 if device != "cpu" else torch.float32,
-            device_map=device if device != "cpu" else None,
-            trust_remote_code=True,
-        )
-        if device == "cpu":
-            self.model = self.model.to(device)
-        self.model.eval()
+        self._load_model(device, mid)
 
     def generate(self, image_path, question, max_new_tokens=256):
         import torch

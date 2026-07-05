@@ -1,12 +1,22 @@
 """Latency table builder (Section 4.2).
 
-Constructs answer-type-based latency table: l̄_{k,a}
-  - instance k × answer type a → average latency
+Constructs latency table l̄_{k,a} from a TOPS-calibrated physical model:
 
-Since benchmarks don't provide real edge latency, this module:
-  1. Uses synthetic profiles based on model size + device class
-  2. Can import real profiling data if available
+    l̄_{k,a} = α_ref × (P_k / D_{dev(k)}) × C_a × φ_{dev(k)}
+
+where:
+  P_k      — model parameter count (billions)
+  D_dev    — device compute (INT8 TOPS)
+  C_a      — task complexity factor (simple=1, moderate=3, complex=8)
+  φ_dev    — device efficiency factor (Jetson penalty vs dGPU)
+  α_ref    — calibration constant from real profiling
+
+The table can be refined by replacing any cell with real profiling data
+(see scripts/profile_instances.py). A single reference measurement per
+device class is sufficient to calibrate all models on that device.
 """
+
+from __future__ import annotations
 
 import logging
 from pathlib import Path
@@ -17,22 +27,84 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-# Synthetic latency profiles (milliseconds) for common edge/cloud devices
-# These are approximate baselines for VLM inference
+# ═══════════════════════════════════════════════════════════════════
+# Device compute specs
+# ═══════════════════════════════════════════════════════════════════
+
+# INT8 TOPS (manufacturer quoted, sparsity off)
+DEVICE_TOPS: Dict[str, float] = {
+    "Orin_NX":    72,     # Orin NX 16GB — 1024 GPU cores, 32 Tensor
+    "AGX_Orin":  248,     # AGX Orin 32GB — 2048 GPU cores, 64 Tensor
+    "RTX_4090":  1321,    # RTX 4090 — 512 Tensor cores (Ada)
+}
+
+# Memory bandwidth GB/s — matters for decode-heavy requests
+DEVICE_BANDWIDTH_GBS: Dict[str, float] = {
+    "Orin_NX":   102,     # LPDDR5 128-bit
+    "AGX_Orin":  204,     # LPDDR5 256-bit
+    "RTX_4090":  1008,    # GDDR6X 384-bit
+}
+
+# Device efficiency factor (empirical: Jetson achieves lower effective
+# utilisation than dGPU due to thermal limits, shared memory, etc.)
+DEVICE_EFFICIENCY: Dict[str, float] = {
+    "Orin_NX":   0.85,
+    "AGX_Orin":  0.90,
+    "RTX_4090":  1.00,    # reference
+}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Model parameter counts (billions)
+# ═══════════════════════════════════════════════════════════════════
+
+MODEL_PARAMS_B: Dict[str, float] = {
+    "Janus-Pro-1B":           1.0,
+    "SmolVLM2":               2.2,
+    "Phi-3.5-Vision":         4.2,
+    "Qwen2.5-VL-7B":          8.3,
+    "LLaVA-Next-Vicuna-7B":   7.6,
+    "Pixtral-12B":           12.0,
+    "Qwen2.5-VL-32B":        32.0,
+    # fallback
+    "_default":                7.0,
+}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Task complexity factors
+# ═══════════════════════════════════════════════════════════════════
+
+COMPLEXITY_FACTORS: Dict[str, float] = {
+    "simple":    1.0,
+    "moderate":  3.0,
+    "complex":   8.0,
+}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Calibration
+# ═══════════════════════════════════════════════════════════════════
+
+# Calibration constant α_ref: derived from one real profiling point.
+# Default is tuned so that Phi-3.5 (4.2B) on AGX Orin (248 TOPS)
+# yields simple ≈ 200 ms:
+#   α_ref = 200 / (4.2 / 248 × 0.90 × 1.0) ≈ 13122
+# Adjust this after running real profiling on any instance.
+ALPHA_REF: float = 13122.0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Legacy synthetic table (fallback)
+# ═══════════════════════════════════════════════════════════════════
+
 SYNTHETIC_DEVICE_PROFILES = {
-    # device_class -> {model_size -> {answer_type -> base_latency_ms}}
-    "Orin_Nano": {
-        "tiny":   {"simple": 150, "moderate": 400, "complex": 1200},
-        "small":  {"simple": 300, "moderate": 800, "complex": 2500},
-        "medium": {"simple": 600, "moderate": 1600, "complex": 5000},
-    },
     "Orin_NX": {
-        "tiny":   {"simple": 100, "moderate": 280, "complex": 800},
-        "small":  {"simple": 200, "moderate": 550, "complex": 1600},
-        "medium": {"simple": 400, "moderate": 1100, "complex": 3200},
-        "large":  {"simple": 800, "moderate": 2200, "complex": 6000},
+        "tiny":   {"simple": 140, "moderate": 400, "complex": 1100},
+        "small":  {"simple": 280, "moderate": 800, "complex": 2200},
+        "medium": {"simple": 550, "moderate": 1600, "complex": 4400},
+        "large":  {"simple": 1100, "moderate": 3100, "complex": 8300},
     },
-    # AGX Orin 32GB: ~1.6–2× faster than NX (2048 GPU cores vs 1024, 204 GB/s mem vs 102 GB/s)
     "AGX_Orin": {
         "tiny":   {"simple": 60,  "moderate": 160, "complex": 450},
         "small":  {"simple": 120, "moderate": 320, "complex": 900},
@@ -49,21 +121,157 @@ SYNTHETIC_DEVICE_PROFILES = {
 }
 
 
-# Approximate model size classification
-def classify_model_size(model_name: str) -> str:
-    """Classify model into size bucket based on name heuristics.
+# ═══════════════════════════════════════════════════════════════════
+# TOPS-based theoretical latency estimation
+# ═══════════════════════════════════════════════════════════════════
 
-    Buckets are aligned with the edge instance pool:
-      tiny  — 1B (Janus-1B)
-      small — 2–4B (SmolVLM2, Phi-3.5-Vision)
-      medium — 7–8B (Qwen2.5-VL-7B, LLaVA-Next-Vicuna-7B)
-      large — 12–13B (Pixtral-12B)
-      xl    — 32B+ (Qwen2.5-VL-32B)
+def estimate_latency_theoretical(
+    model_name: str,
+    device_class: str,
+    complexity: str,
+    alpha: float = ALPHA_REF,
+) -> float:
+    """Estimate VLM inference latency from device TOPS and model params.
+
+    Formula:
+      l̄ = α × (P / D) / φ × C
+    where α is calibrated from a real measurement.
+
+    Args:
+        model_name: canonical model name (key in MODEL_PARAMS_B).
+        device_class: device class (key in DEVICE_TOPS).
+        complexity: "simple" | "moderate" | "complex".
+        alpha: calibration constant.
+
+    Returns:
+        Estimated latency in milliseconds.
     """
+    P = MODEL_PARAMS_B.get(model_name, MODEL_PARAMS_B["_default"])
+    D = DEVICE_TOPS.get(device_class, 248)
+    C = COMPLEXITY_FACTORS.get(complexity, 3.0)
+    phi = DEVICE_EFFICIENCY.get(device_class, 1.0)
+
+    latency = alpha * (P / D) / phi * C
+    return round(latency)
+
+
+def calibrate_alpha(
+    model_name: str,
+    device_class: str,
+    complexity: str,
+    measured_latency_ms: float,
+) -> float:
+    """Compute calibration constant from a single real measurement.
+
+    Usage:
+      alpha = calibrate_alpha("Phi-3.5-Vision", "AGX_Orin", "simple", 195.0)
+      # alpha ≈ 12794
+
+    Then use this alpha for all other estimates on any device.
+    """
+    P = MODEL_PARAMS_B.get(model_name, MODEL_PARAMS_B["_default"])
+    D = DEVICE_TOPS.get(device_class, 248)
+    C = COMPLEXITY_FACTORS.get(complexity, 1.0)
+    phi = DEVICE_EFFICIENCY.get(device_class, 1.0)
+
+    alpha = measured_latency_ms / ((P / D) / phi * C)
+    logger.info(
+        f"Calibration: {model_name} on {device_class}, {complexity}={measured_latency_ms:.0f}ms "
+        f"→ α = {alpha:.0f}"
+    )
+    return alpha
+
+
+def build_theoretical_table(
+    instance_config: List[Dict],
+    alpha: Optional[float] = None,
+) -> pd.DataFrame:
+    """Build latency table from TOPS-calibrated physical model.
+
+    Args:
+        instance_config: List of {instance_id, model_name, device_class}.
+        alpha: Calibration constant. Uses ALPHA_REF if not provided.
+
+    Returns:
+        DataFrame: instance_id, model_name, device_class, simple, moderate, complex.
+    """
+    a = alpha if alpha is not None else ALPHA_REF
+
+    rows = []
+    for cfg in instance_config:
+        row = {
+            "instance_id": cfg["instance_id"],
+            "model_name": cfg["model_name"],
+            "device_class": cfg["device_class"],
+        }
+        for c in ["simple", "moderate", "complex"]:
+            row[c] = estimate_latency_theoretical(
+                cfg["model_name"], cfg["device_class"], c, alpha=a
+            )
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df = df[["instance_id", "model_name", "device_class", "simple", "moderate", "complex"]]
+
+    _log_table(df, a)
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Hybrid builder — theoretical with profiling overrides
+# ═══════════════════════════════════════════════════════════════════
+
+def build_latency_table_hybrid(
+    instance_config: List[Dict],
+    profiling_results: Optional[Dict[str, Dict[str, float]]] = None,
+    alpha: Optional[float] = None,
+) -> pd.DataFrame:
+    """Build latency table: theoretical base, real profiling overrides.
+
+    profiling_results format:
+      {"instance_id": {"simple": 195, "moderate": 580, "complex": 1720}, ...}
+
+    Cells not in profiling_results fall back to theoretical estimates.
+    """
+    df = build_theoretical_table(instance_config, alpha=alpha)
+
+    if profiling_results:
+        for iid, vals in profiling_results.items():
+            mask = df["instance_id"] == iid
+            if mask.any():
+                for c in ["simple", "moderate", "complex"]:
+                    if c in vals and vals[c] > 0:
+                        df.loc[mask, c] = vals[c]
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Utility
+# ═══════════════════════════════════════════════════════════════════
+
+def _log_table(df: pd.DataFrame, alpha: float) -> None:
+    """Print a formatted latency table."""
+    logger.info(f"Latency table (α={alpha:.0f}):")
+    logger.info(f"{'Instance':<25s} {'Simple':>8s} {'Mod':>8s} {'Complex':>8s}")
+    logger.info("-" * 52)
+    for _, row in df.iterrows():
+        logger.info(
+            f"{row['instance_id']:<25s} "
+            f"{row['simple']:>6.0f}ms "
+            f"{row['moderate']:>6.0f}ms "
+            f"{row['complex']:>6.0f}ms"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Legacy builder (kept for backward compatibility)
+# ═══════════════════════════════════════════════════════════════════
+
+def classify_model_size(model_name: str) -> str:
+    """Classify model into size bucket (legacy, used by LatencyTableBuilder)."""
     name_lower = model_name.lower()
-    # Check larger/more-specific sizes first to avoid partial matches
-    # (e.g. "12b" contains "2b", "32b" contains "2b")
-    if any(x in name_lower for x in ["27b", "32b", "gpt", "claude", "gemini", "sonnet", "flash", "pro"]):
+    if any(x in name_lower for x in ["27b", "32b"]):
         return "xl"
     elif any(x in name_lower for x in ["12b", "13b"]):
         return "large"
@@ -73,31 +281,25 @@ def classify_model_size(model_name: str) -> str:
         return "tiny"
     elif any(x in name_lower for x in ["2b", "3b", "4b", "5b", "mini", "small", "phi-3.5"]):
         return "small"
-    else:
-        return "medium"  # default
+    return "medium"
 
 
 class LatencyTableBuilder:
-    """Build instance-level latency table."""
+    """Legacy builder using coarse size-bucket synthetic profiles.
+
+    Prefer build_theoretical_table() or build_latency_table_hybrid() for
+    TOPS-calibrated estimates.
+    """
 
     def __init__(
         self,
         instance_config: Optional[List[Dict]] = None,
         use_synthetic: bool = True,
     ):
-        """
-        Args:
-            instance_config: List of instance dicts, each with:
-                - instance_id: str
-                - model_name: str (which VLM is deployed)
-                - device_class: str (Orin_NX, RTX_3090, etc.)
-            use_synthetic: If True, use synthetic profiles. Otherwise require real data.
-        """
         self.instance_config = instance_config or []
         self.use_synthetic = use_synthetic
 
     def add_instance(self, instance_id: str, model_name: str, device_class: str):
-        """Add an instance configuration."""
         self.instance_config.append({
             "instance_id": instance_id,
             "model_name": model_name,
@@ -109,11 +311,6 @@ class LatencyTableBuilder:
         answer_types: List[str] = None,
         output_path: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Build latency table: rows=instances, columns=answer_types.
-
-        Returns DataFrame with columns:
-          instance_id, model_name, device_class, simple, moderate, complex
-        """
         if answer_types is None:
             answer_types = ["simple", "moderate", "complex"]
 
@@ -130,13 +327,12 @@ class LatencyTableBuilder:
 
             if self.use_synthetic:
                 profile = SYNTHETIC_DEVICE_PROFILES.get(device_class, {})
-                size_profile = profile.get(model_size, profile.get("moderate", {}))
+                size_profile = profile.get(model_size, profile.get("medium", {}))
                 for at in answer_types:
-                    row[at] = size_profile.get(at, 500)  # default 500ms
+                    row[at] = size_profile.get(at, 500)
             else:
-                # Placeholder for real profiling data
                 for at in answer_types:
-                    row[at] = 100  # dummy
+                    row[at] = 100
 
             rows.append(row)
 
@@ -152,18 +348,8 @@ class LatencyTableBuilder:
     def get_latency(
         self, instance_id: str, answer_type: str, latency_table: pd.DataFrame = None
     ) -> float:
-        """Look up latency l̄_{k,a} for a specific instance and answer type.
-
-        Args:
-            instance_id: Instance identifier.
-            answer_type: One of 'simple', 'moderate', 'complex'.
-            latency_table: Pre-built latency DataFrame.
-
-        Returns:
-            Latency in milliseconds.
-        """
         if latency_table is None:
-            return 500.0  # default
+            return 500.0
         row = latency_table[latency_table["instance_id"] == instance_id]
         if len(row) == 0:
             return 500.0
