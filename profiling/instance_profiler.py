@@ -129,6 +129,37 @@ class ModelAdapter(ABC):
         """Free GPU memory."""
         ...
 
+    def _fallback_load(self, device: str, mid: str) -> bool:
+        """Fallback: load config with trust_remote_code, then model.
+
+        Some transformers versions (notably 4.46.x) reject unknown model_types
+        in AutoConfig even with trust_remote_code=True. This bypasses that by
+        loading the config object first.
+
+        Returns True on success.
+        """
+        import torch
+        from transformers import AutoConfig, AutoModel, AutoModelForVision2Seq
+
+        self._device = device
+        for model_cls in [AutoModelForVision2Seq, AutoModel]:
+            try:
+                config = AutoConfig.from_pretrained(mid, trust_remote_code=True)
+                self.model = model_cls.from_pretrained(
+                    mid,
+                    config=config,
+                    torch_dtype=torch.float16 if device != "cpu" else torch.float32,
+                    device_map=device if device != "cpu" else None,
+                    trust_remote_code=True,
+                )
+                if device == "cpu":
+                    self.model = self.model.to(device)
+                self.model.eval()
+                return True
+            except Exception:
+                continue
+        return False
+
 
 class QwenVLAdapter(ModelAdapter):
     """Qwen2.5-VL family (7B, 32B).
@@ -167,12 +198,23 @@ class QwenVLAdapter(ModelAdapter):
                 "using AutoModelForVision2Seq. Upgrade to transformers>=4.45 for full support."
             )
 
-        self.model = model_cls.from_pretrained(
-            mid,
-            torch_dtype=torch.float16 if device != "cpu" else torch.float32,
-            device_map=device if device != "cpu" else None,
-            trust_remote_code=True,
-        )
+        try:
+            self.model = model_cls.from_pretrained(
+                mid,
+                torch_dtype=torch.float16 if device != "cpu" else torch.float32,
+                device_map=device if device != "cpu" else None,
+                trust_remote_code=True,
+            )
+        except ValueError:
+            logger.warning(
+                "Direct loading failed — trying fallback via AutoConfig..."
+            )
+            if not self._fallback_load(device, mid):
+                raise RuntimeError(
+                    f"Cannot load {mid}: model type not recognized by "
+                    f"this transformers version. Try: pip install --upgrade transformers"
+                )
+
         if device == "cpu":
             self.model = self.model.to(device)
         self.model.eval()
@@ -265,8 +307,12 @@ class LlavaAdapter(ModelAdapter):
         self._device = None
 
     def load(self, device: str, model_id: Optional[str] = None) -> None:
+        import os
         import torch
         from transformers import LlavaForConditionalGeneration, AutoProcessor
+
+        # Fix protobuf/sentencepiece conflict on older environments
+        os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
         mid = model_id or self.DEFAULT_MODEL_ID
         logger.info(f"Loading LLaVA: {mid}")
@@ -393,12 +439,23 @@ class SmolVLMAdapter(ModelAdapter):
                 "using AutoModel. Upgrade to transformers>=4.40 for full support."
             )
 
-        self.model = model_cls.from_pretrained(
-            mid,
-            torch_dtype=torch.float16 if device != "cpu" else torch.float32,
-            device_map=device if device != "cpu" else None,
-            trust_remote_code=True,
-        )
+        try:
+            self.model = model_cls.from_pretrained(
+                mid,
+                torch_dtype=torch.float16 if device != "cpu" else torch.float32,
+                device_map=device if device != "cpu" else None,
+                trust_remote_code=True,
+            )
+        except ValueError:
+            logger.warning(
+                "Direct loading failed — trying fallback via AutoConfig..."
+            )
+            if not self._fallback_load(device, mid):
+                raise RuntimeError(
+                    f"Cannot load {mid}: model type not recognized by "
+                    f"this transformers version. Try: pip install --upgrade transformers"
+                )
+
         if device == "cpu":
             self.model = self.model.to(device)
         self.model.eval()
@@ -494,8 +551,8 @@ class PhiVisionAdapter(ModelAdapter):
             mid, trust_remote_code=True
         )
 
-        # Use SDPA (PyTorch native) — works everywhere without flash_attn
-        attn = "sdpa" if device != "cpu" else "eager"
+        # Phi3V only supports eager attention
+        attn = "eager"
         self.model = AutoModelForCausalLM.from_pretrained(
             mid,
             torch_dtype=torch.float16 if device != "cpu" else torch.float32,
