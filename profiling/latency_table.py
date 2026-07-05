@@ -61,16 +61,18 @@ def classify_model_size(model_name: str) -> str:
       xl    — 32B+ (Qwen2.5-VL-32B)
     """
     name_lower = model_name.lower()
-    if any(x in name_lower for x in ["1b", "tiny", "nano"]):
-        return "tiny"
-    elif any(x in name_lower for x in ["2b", "3b", "4b", "5b", "mini", "small", "smol", "phi-3.5"]):
-        return "small"
-    elif any(x in name_lower for x in ["7b", "8b"]):
-        return "medium"
+    # Check larger/more-specific sizes first to avoid partial matches
+    # (e.g. "12b" contains "2b", "32b" contains "2b")
+    if any(x in name_lower for x in ["27b", "32b", "gpt", "claude", "gemini", "sonnet", "flash", "pro"]):
+        return "xl"
     elif any(x in name_lower for x in ["12b", "13b"]):
         return "large"
-    elif any(x in name_lower for x in ["27b", "32b", "gpt", "claude", "gemini", "sonnet", "flash", "pro"]):
-        return "xl"
+    elif any(x in name_lower for x in ["7b", "8b"]):
+        return "medium"
+    elif any(x in name_lower for x in ["1b", "tiny", "nano", "smolvlm"]):
+        return "tiny"
+    elif any(x in name_lower for x in ["2b", "3b", "4b", "5b", "mini", "small", "phi-3.5"]):
+        return "small"
     else:
         return "medium"  # default
 
