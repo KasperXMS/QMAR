@@ -21,15 +21,32 @@ conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvi
 pip install -r requirements.txt
 ```
 
-**Jetson devices (Orin NX / AGX Orin):** Conda is not officially supported on aarch64. Use system Python + pip instead:
+**Jetson devices (Orin NX / AGX Orin):**
+
+JetPack ships Python 3.8 with PyTorch pre-installed. Newer VLM models need transformers ≥ 4.40 and protobuf fix:
 
 ```bash
-# Jetson comes with PyTorch pre-installed via JetPack.
-# Verify:
+# Verify PyTorch
 python3 -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
 
-# Then install remaining dependencies:
+# Fix protobuf conflict (required for LLaVA tokenizer)
+pip install protobuf==3.20.3
+
+# Upgrade transformers (needed for Qwen2.5-VL, SmolVLM)
+pip install --upgrade "transformers>=4.44"
+
+# Install remaining dependencies
 pip install -r requirements.txt
+```
+
+- Python 3.10+ is recommended for full model support. On Jetson with JetPack 6.x, create a conda env with Python 3.10:
+  ```bash
+  conda create -n qmar python=3.10 -y && conda activate qmar
+  ```
+  If conda is unavailable, use `pyenv` or a Docker container with `nvcr.io/nvidia/l4t-pytorch`.
+- If stuck on Python 3.8, models will load with `trust_remote_code=True` (the profiler does this automatically), but you may see fallback warnings.
+
+**RTX 4090 (x86):** Standard conda/venv works. See Option A or B below.
 ```
 
 ### Option B: venv (any platform)

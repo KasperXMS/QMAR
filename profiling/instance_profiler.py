@@ -365,15 +365,35 @@ class SmolVLMAdapter(ModelAdapter):
 
     def load(self, device: str, model_id: Optional[str] = None) -> None:
         import torch
-        from transformers import AutoProcessor, AutoModelForVision2Seq
 
         mid = model_id or self.DEFAULT_MODEL_ID
         logger.info(f"Loading SmolVLM2: {mid}")
 
         self._device = device
-        self.processor = AutoProcessor.from_pretrained(mid)
 
-        self.model = AutoModelForVision2Seq.from_pretrained(
+        # Try to get processor — SmolVLM2 needs trust_remote_code
+        try:
+            from transformers import AutoProcessor
+            self.processor = AutoProcessor.from_pretrained(
+                mid, trust_remote_code=True
+            )
+        except Exception as e:
+            logger.warning(f"AutoProcessor failed: {e}. Trying without processor...")
+            self.processor = None
+
+        # Try model-specific class first, fall back to AutoModel
+        try:
+            from transformers import AutoModelForVision2Seq
+            model_cls = AutoModelForVision2Seq
+        except ImportError:
+            from transformers import AutoModel
+            model_cls = AutoModel
+            logger.warning(
+                "AutoModelForVision2Seq not available — "
+                "using AutoModel. Upgrade to transformers>=4.40 for full support."
+            )
+
+        self.model = model_cls.from_pretrained(
             mid,
             torch_dtype=torch.float16 if device != "cpu" else torch.float32,
             device_map=device if device != "cpu" else None,

@@ -240,8 +240,74 @@ def filter_instances(
     return filtered
 
 
+def preflight_check() -> dict:
+    """Check environment and report version info.
+
+    Returns a dict of {package: version} for diagnostics.
+    """
+    import sys
+    import torch
+    import transformers
+
+    info = {
+        "python": sys.version.split()[0],
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+        "cuda_available": torch.cuda.is_available(),
+    }
+    if torch.cuda.is_available():
+        info["cuda_version"] = torch.version.cuda
+        info["gpu_name"] = torch.cuda.get_device_name(0)
+
+    logger.info("── Environment ──")
+    for k, v in info.items():
+        logger.info(f"  {k}: {v}")
+
+    # Compatibility warnings
+    py_major, py_minor = map(int, info["python"].split(".")[:2])
+    tf_major, tf_minor = map(int, info["transformers"].split(".")[:2])
+
+    issues = []
+
+    if (py_major, py_minor) < (3, 9):
+        issues.append(
+            "Python < 3.9 — some models may need trust_remote_code=True. "
+            "Consider: conda install python=3.10"
+        )
+
+    if (tf_major, tf_minor) < (4, 40):
+        issues.append(
+            f"transformers {info['transformers']} is old — Qwen2.5-VL / SmolVLM "
+            "may fail. Run: pip install --upgrade transformers"
+        )
+
+    # Check protobuf
+    try:
+        import google.protobuf
+        pb_ver = google.protobuf.__version__
+        if pb_ver.startswith("4."):
+            issues.append(
+                f"protobuf {pb_ver} conflicts with sentencepiece. "
+                "Run: pip install protobuf==3.20.3"
+            )
+    except ImportError:
+        pass
+
+    if issues:
+        logger.warning("── Known issues ──")
+        for issue in issues:
+            logger.warning(f"  ⚠ {issue}")
+    else:
+        logger.info("  ✓ No known compatibility issues")
+
+    return info
+
+
 def run_profiling(args) -> None:
     """Main profiling workflow."""
+    # Pre-flight check
+    preflight_check()
+
     # Load config
     instances = load_instance_config(args.instance_config)
     logger.info(f"Loaded {len(instances)} instances from {args.instance_config}")
